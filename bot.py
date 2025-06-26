@@ -4,67 +4,65 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    filters,
     ContextTypes,
+    filters,
 )
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
-import asyncio
+import os
 
-# --- CONFIGURATION ---
+# Configuration
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7687564005:AAGLOFkYSA_pDj6nXCE11VAJQJzWGc_PaEk")
+ADMIN_ID = 250181723
+VIP_CHANNEL_ID = -1002282793492
 
-TOKEN = "7687564005:AAGLOFkYSA_pDj6nXCE11VAJQJzWGc_PaEk"  # Your bot token
-VIP_CHANNEL_ID = -1002282793492  # Your VIP channel ID (with -100 prefix)
-ADMIN_USER_ID = 250181723  # Your Telegram user ID
-
-# --- SETUP LOGGING ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+# Logger
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- VIP USERS TRACKING ---
-vip_users = {}  # user_id -> expiration datetime
+# Dictionary to store approved users and their expiration times
+approved_users = {}
 
-scheduler = AsyncIOScheduler()
+# Scheduler for removing users after 30 days
+scheduler = BackgroundScheduler()
+scheduler.start()
 
+# Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hello! To get VIP access, please pay and send a screenshot here along with your username."
+        "Welcome! To access the VIP channel, please:\n\n"
+        "1️⃣ Send a screenshot of your payment.\n"
+        "2️⃣ Send your Telegram username (e.g. @yourusername).\n\n"
+        "💳 Payment address:\n1234567890\n\n"
+        "Your request will be reviewed shortly. Thank you!"
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send your payment screenshot and your Telegram username.")
-
-async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Handle photo (payment screenshot)
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
-    text = update.message.text or ""
-    photo = update.message.photo
+    caption = update.message.caption or ""
+    file_id = update.message.photo[-1].file_id
 
-    if photo:
-        username = text.strip() if text else update.message.caption or ""
-        if not username:
-            await update.message.reply_text(
-                "Please include your Telegram username with the payment screenshot."
-            )
-            return
+    await context.bot.send_photo(
+        chat_id=ADMIN_ID,
+        photo=file_id,
+        caption=f"🧾 New payment screenshot from @{user.username or user.first_name} ({user.id})\n\nCaption: {caption}",
+    )
 
-        # Forward message to admin
-        await context.bot.send_message(
-            chat_id=ADMIN_USER_ID,
-            text=f"Payment screenshot from @{user.username} (ID: {user.id})\nUsername provided: {username}",
-        )
-        await update.message.reply_text(
-            "Thank you! Your payment is pending admin approval."
-        )
-    else:
-        await update.message.reply_text(
-            "Please send a payment screenshot photo along with your Telegram username."
-        )
+# Handle text (username)
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    message = update.message.text
 
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"📨 New message from @{user.username or user.first_name} ({user.id}):\n{message}",
+    )
+
+# Approve command (used by admin manually)
 async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID:
-        await update.message.reply_text("You are not authorized to approve payments.")
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ You are not authorized to use this command.")
         return
 
     if len(context.args) != 1:
@@ -73,48 +71,41 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         user_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("User ID must be an integer.")
-        return
+        expiration = datetime.now() + timedelta(days=30)
 
-    expire_date = datetime.utcnow() + timedelta(days=30)
-    vip_users[user_id] = expire_date
+        await context.bot.invite_chat_member(chat_id=VIP_CHANNEL_ID, user_id=user_id)
+        approved_users[user_id] = expiration
 
-    try:
-        await context.bot.invite_chat_member(VIP_CHANNEL_ID, user_id)
+        await update.message.reply_text(f"✅ User {user_id} has been added to the VIP channel for 30 days.")
+
+        # Schedule automatic removal
+        scheduler.add_job(
+            remove_user,
+            'date',
+            run_date=expiration,
+            args=[context.bot, user_id],
+        )
+
     except Exception as e:
-        logger.error(f"Failed to add user {user_id} to VIP channel: {e}")
+        await update.message.reply_text(f"Error: {e}")
 
-    await update.message.reply_text(
-        f"User {user_id} approved and added to VIP channel until {expire_date} UTC."
-    )
+# Remove user function
+async def remove_user(bot, user_id):
+    try:
+        await bot.ban_chat_member(chat_id=VIP_CHANNEL_ID, user_id=user_id)
+        await bot.unban_chat_member(chat_id=VIP_CHANNEL_ID, user_id=user_id)
+        logger.info(f"✅ User {user_id} has been removed after 30 days.")
+    except Exception as e:
+        logger.error(f"❌ Failed to remove user {user_id}: {e}")
 
-async def remove_expired_users():
-    while True:
-        now = datetime.utcnow()
-        expired = [uid for uid, exp in vip_users.items() if exp < now]
-
-        for user_id in expired:
-            try:
-                await application.bot.ban_chat_member(VIP_CHANNEL_ID, user_id)
-                vip_users.pop(user_id)
-                logger.info(f"Removed expired VIP user {user_id}")
-            except Exception as e:
-                logger.error(f"Error removing user {user_id}: {e}")
-
-        await asyncio.sleep(3600)  # check every hour
-
+# Main
 if name == "__main__":
-    application = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("approve", approve))
-    application.add_handler(
-        MessageHandler(filters.PHOTO & ~filters.COMMAND, payment_handler)
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("approve", approve))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    scheduler.add_job(remove_expired_users)
-    scheduler.start()
-
-    application.run_polling()
+    print("🤖 Bot is running...")
+    app.run_polling()
