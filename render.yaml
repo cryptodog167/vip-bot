@@ -2,7 +2,5 @@ services:
   - type: web
     name: vip-bot
     env: python
-    region: frankfurt
-    pythonVersion: 3.11
-    buildCommand: ""
-    startCommand: "python bot.py"
+    pythonVersion: 3.10.11
+    startCommand: python bot.py
